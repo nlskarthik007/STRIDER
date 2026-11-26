@@ -14,16 +14,16 @@ def _wrap_angle(angle: float) -> float:
 
 class MazeHierEnv(gym.Env):
     """
-    Hierarchical MuJoCo maze navigation environment.
-    - High-level policy: Discrete(4) relative cell moves [Forward, Left, Right, Back]
-    - Low-level controller: High-speed 200 Hz PD-damped turns + front-wall-aware 0.30 m drives
-    - Includes Lookahead Cruise-Through for non-stop multi-cell straightaways.
+    Hierarchical MuJoCo maze navigation environment with:
+    - Friction-adaptive traction control & ToF-fused slip-resistant odometry
+    - Arbitrary-angle turns (any degree) via gyro-locked PD control
+    - Continuous R=0.15 m quarter-circle arc cornering + straightaway lookahead
     """
 
     metadata = {"render_modes": ["human"]}
 
     # Cardinal headings: 0=East (+x), 1=North (+y), 2=West (-x), 3=South (-y)
-    HEADING_DC_DR = [(1, 0), (0, 1), (-1, 0), (0, -1)]  # (dc, dr)
+    HEADING_DC_DR = [(1, 0), (0, 1), (-1, 0), (0, -1)]
     HEADING_YAW = [0.0, 0.5 * math.pi, math.pi, -0.5 * math.pi]
     REL_DELTA_H = [0, 1, 3, 2]  # 0:F, 1:L (+90), 2:R (-90), 3:B (180)
 
@@ -38,9 +38,11 @@ class MazeHierEnv(gym.Env):
         max_moves: int = 80,
         noise_enabled: bool = False,
         render_realtime: bool = False,
-        cruise_speed: float = 0.62,
+        cruise_speed: float = 0.60,
         brake_dist: float = 0.10,
-        accel: float = 2.0,
+        accel: float = 1.9,
+        friction_range: tuple = (1.0, 1.0),
+        enable_arc_turns: bool = True,
     ):
         super().__init__()
         self.buggy_xml_path = buggy_xml_path
@@ -53,7 +55,15 @@ class MazeHierEnv(gym.Env):
         self.noise_enabled = noise_enabled
         self.render_realtime = render_realtime
 
-        # High-speed motion profile defaults
+        # Motion & surface parameters
+        self.base_cruise_speed = cruise_speed
+        self.base_brake_dist = brake_dist
+        self.base_accel = accel
+        self.friction_range = friction_range
+        self.current_friction = 1.0
+        self.enable_arc_turns = enable_arc_turns
+
+        # Active traction-scaled limits (updated per episode in reset)
         self.cruise_speed = cruise_speed
         self.brake_dist = brake_dist
         self.accel = accel
@@ -88,10 +98,11 @@ class MazeHierEnv(gym.Env):
         self._wall_geom_ids = set()
         self._bot_geom_ids = set()
 
-        # Episode state
+        # Episode state (continuous target_yaw supports any-degree turns)
         self.odom_r = 0
         self.odom_c = 0
         self.odom_h = 0
+        self.target_yaw = 0.0
         self.odom_yaw = 0.0
         self.goal_r = 0
         self.goal_c = 0
@@ -102,7 +113,7 @@ class MazeHierEnv(gym.Env):
         self._move_wall_hits = 0
 
     # ------------------------------------------------------------------
-    # MuJoCo ID Resolution & Low-Level I/O
+    # MuJoCo ID Resolution, Friction Setup & Low-Level I/O
     # ------------------------------------------------------------------
     def _resolve_id(self, obj_type, name: str) -> int:
         for candidate in (f"bot/{name}", name):
@@ -141,6 +152,22 @@ class MazeHierEnv(gym.Env):
                 self._wall_geom_ids.add(gid)
             elif gname.startswith("bot/"):
                 self._bot_geom_ids.add(gid)
+
+    def _apply_surface_friction(self, mu: float):
+        """Set floor sliding friction and scale traction envelope to prevent wheel slip."""
+        self.current_friction = float(mu)
+        for gid in range(self.model.ngeom):
+            gname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid) or ""
+            if "floor" in gname or "ground" in gname or gid == 0:
+                self.model.geom_friction[gid, 0] = self.current_friction
+
+        # Scale acceleration & braking envelope smoothly with available surface grip
+        grip_scale = float(np.clip(self.current_friction, 0.25, 1.0))
+        self.accel = self.base_accel * (grip_scale ** 0.75)
+        self.cruise_speed = self.base_cruise_speed * (0.65 + 0.35 * grip_scale)
+        self.brake_dist = float(
+            np.clip(self.base_brake_dist / max(grip_scale, 0.45), 0.09, 0.16)
+        )
 
     def _read_rf(self, key: str) -> float:
         adr = self._sensor_adr.get(key, -1)
@@ -187,6 +214,32 @@ class MazeHierEnv(gym.Env):
             wl += float(self.rng.normal(0.0, 0.08))
             wr += float(self.rng.normal(0.0, 0.08))
         return 0.5 * (wl + wr) * self.wheel_radius
+
+    def _fused_step_distance(self, prev_rf: dict, cur_rf: dict, dt: float) -> float:
+        """
+        Slip-resistant longitudinal step estimator:
+        Fuses wheel encoder velocity with front/back ToF range deltas so wheel spin
+        or brake sliding on low-friction surfaces cannot corrupt distance tracking.
+        """
+        enc_ds = self._read_forward_speed() * dt
+        tof_ds_list = []
+
+        if prev_rf["front"] < 1.05 and cur_rf["front"] < 1.05:
+            df = prev_rf["front"] - cur_rf["front"]
+            if abs(df - enc_ds) < 0.015:  # reject sudden wall-opening discontinuities
+                tof_ds_list.append(df)
+
+        if prev_rf["back"] < 1.05 and cur_rf["back"] < 1.05:
+            db = cur_rf["back"] - prev_rf["back"]
+            if abs(db - enc_ds) < 0.015:
+                tof_ds_list.append(db)
+
+        if tof_ds_list:
+            tof_ds = float(np.mean(tof_ds_list))
+            # Trust ToF heavily on slippery surfaces where wheels slip
+            w_tof = 0.75 if self.current_friction < 0.65 else 0.45
+            return (1.0 - w_tof) * enc_ds + w_tof * tof_ds
+        return enc_ds
 
     def _apply_wheel_vel(self, w_l: float, w_r: float):
         self.data.ctrl[self._act_l] = float(
@@ -262,7 +315,6 @@ class MazeHierEnv(gym.Env):
             adj_visited.append(1.0 if cnt > 0 else 0.0)
             adj_counts.append(min(cnt, 4) / 4.0)
 
-        # Body-frame normalized goal bearing
         dx_w = (self.goal_c - self.odom_c) * self.cell_size
         dy_w = (self.goal_r - self.odom_r) * self.cell_size
         dist_g = math.hypot(dx_w, dy_w)
@@ -285,14 +337,13 @@ class MazeHierEnv(gym.Env):
         return np.clip(obs, -1.0, 1.0)
 
     # ------------------------------------------------------------------
-    # Low-Level Motion Primitives (200 Hz PD/PID)
+    # Arbitrary-Angle Turns, Curved Arcs & Low-Level Motion Primitives
     # ------------------------------------------------------------------
     def _compute_corridor_steering(self, rf: dict) -> float:
-        target_yaw = self.HEADING_YAW[self.odom_h]
-        yaw_err = _wrap_angle(target_yaw - self.odom_yaw)
+        yaw_err = _wrap_angle(self.target_yaw - self.odom_yaw)
         gyro_z = self._read_gyro_z()
 
-        w_cmd = 5.0 * yaw_err - 0.22 * gyro_z
+        w_cmd = 5.0 * yaw_err - 0.24 * gyro_z
 
         side_thresh = self.cell_size * 0.65
         rf_l, rf_r = rf["left"], rf["right"]
@@ -311,27 +362,26 @@ class MazeHierEnv(gym.Env):
 
         return float(np.clip(w_cmd, -4.5, 4.5))
 
-    def _settle_stop(self, max_ticks: int = 6):
+    def _settle_stop(self, max_ticks: int = 8):
         for _ in range(max_ticks):
             self._apply_wheel_vel(0.0, 0.0)
             self._sim_tick()
-            if abs(self._read_forward_speed()) < 0.025:
+            if abs(self._read_forward_speed()) < 0.025 and abs(self._read_gyro_z()) < 0.15:
                 break
 
-    def turn_in_place(self, rel_action: int, max_ticks: int = 220):
-        """Phase A: High-gain PD-damped 90°/180° in-place turn."""
-        delta_h = self.REL_DELTA_H[int(rel_action)]
-        if delta_h == 0:
-            return
-        self.odom_h = (self.odom_h + delta_h) % 4
-        target_yaw = self.HEADING_YAW[self.odom_h]
+    def turn_to_yaw(self, target_yaw: float, max_ticks: int = 260):
+        """Rotate in place to ANY target angle (in radians) with gyro-damped PD control."""
+        self.target_yaw = _wrap_angle(float(target_yaw))
+        max_w = 7.5 * float(np.clip(self.current_friction, 0.35, 1.0))
+        kp = 7.5 * float(np.clip(self.current_friction, 0.45, 1.0))
+        kd = 0.34
 
         settled = 0
         for _ in range(max_ticks):
-            yaw_err = _wrap_angle(target_yaw - self.odom_yaw)
+            yaw_err = _wrap_angle(self.target_yaw - self.odom_yaw)
             gyro_z = self._read_gyro_z()
 
-            if abs(yaw_err) < 0.018 and abs(gyro_z) < 0.20:
+            if abs(yaw_err) < 0.016 and abs(gyro_z) < 0.18:
                 settled += 1
                 self._set_vw(0.0, 0.0)
                 self._sim_tick()
@@ -339,13 +389,79 @@ class MazeHierEnv(gym.Env):
                     break
             else:
                 settled = 0
-                w_cmd = float(np.clip(7.8 * yaw_err - 0.34 * gyro_z, -7.8, 7.8))
-                if abs(yaw_err) > 0.018 and abs(w_cmd) < 0.55:
-                    w_cmd = math.copysign(0.55, yaw_err)
+                w_cmd = float(np.clip(kp * yaw_err - kd * gyro_z, -max_w, max_w))
+                if abs(yaw_err) > 0.016 and abs(w_cmd) < 0.50:
+                    w_cmd = math.copysign(0.50, yaw_err)
                 self._set_vw(0.0, w_cmd)
                 self._sim_tick()
 
         self._apply_wheel_vel(0.0, 0.0)
+
+    def turn_by_degrees(self, degrees: float, max_ticks: int = 260):
+        """Rotate relative to current target heading by ANY angle in degrees (+CCW, -CW)."""
+        new_yaw = _wrap_angle(self.target_yaw + math.radians(float(degrees)))
+        self.turn_to_yaw(new_yaw, max_ticks=max_ticks)
+
+    def turn_in_place(self, rel_action: int, max_ticks: int = 260):
+        """Phase A: Cardinal 90°/180° turn built on top of arbitrary-angle turn_to_yaw."""
+        delta_h = self.REL_DELTA_H[int(rel_action)]
+        if delta_h == 0:
+            return
+        self.odom_h = (self.odom_h + delta_h) % 4
+        self.turn_to_yaw(self.HEADING_YAW[self.odom_h], max_ticks=max_ticks)
+
+    def drive_arc_turn(self, turn_action: int, max_ticks: int = 220) -> bool:
+        """
+        Continuous quarter-circle arc cornering (R = 0.5 * cell_size = 0.15 m).
+        Transitions smoothly from cell entrance (dist=0.15 m) onto the perpendicular
+        corridor centerline without braking to zero.
+        """
+        assert turn_action in (1, 2), "Arc turn only supports Left (1) or Right (2)"
+        turn_sign = 1.0 if turn_action == 1 else -1.0
+        R = 0.5 * self.cell_size  # 0.15 m radius aligns entry & exit midpoints
+        arc_len = 0.5 * math.pi * R
+
+        start_yaw = self.target_yaw
+        self.odom_h = (self.odom_h + self.REL_DELTA_H[turn_action]) % 4
+        end_yaw = self.HEADING_YAW[self.odom_h]
+        self.target_yaw = end_yaw
+
+        v_arc = min(0.30, self.cruise_speed * 0.52)
+        s = 0.0
+        dt = self.model.opt.timestep
+        prev_rf = self._read_rangefinders()
+
+        for _ in range(max_ticks):
+            rf = self._read_rangefinders()
+            # Abort arc safely into straight brake if inner/outer diagonal clips
+            if rf["fl"] < 0.072 or rf["fr"] < 0.072:
+                self._settle_stop()
+                self.turn_to_yaw(end_yaw)
+                return False
+
+            prog = float(np.clip(s / arc_len, 0.0, 1.0))
+            ref_yaw = _wrap_angle(start_yaw + turn_sign * 0.5 * math.pi * prog)
+            yaw_err = _wrap_angle(ref_yaw - self.odom_yaw)
+            gyro_z = self._read_gyro_z()
+
+            # Feedforward curvature w = v/R + gyro-damped trajectory tracking
+            w_ff = turn_sign * (v_arc / R)
+            w_cmd = float(np.clip(w_ff + 6.5 * yaw_err - 0.25 * gyro_z, -4.5, 4.5))
+
+            self._set_vw(v_arc, w_cmd)
+            self._sim_tick()
+
+            ds = max(0.0, self._read_forward_speed() * dt)
+            s += ds
+            prev_rf = rf
+
+            if prog >= 0.96 and abs(_wrap_angle(end_yaw - self.odom_yaw)) < 0.05:
+                break
+
+        # Final micro-trim to exact cardinal heading if friction caused slight understeer
+        if abs(_wrap_angle(end_yaw - self.odom_yaw)) > 0.03:
+            self.turn_to_yaw(end_yaw, max_ticks=60)
+        return True
 
     def _execute_move(
         self,
@@ -353,7 +469,7 @@ class MazeHierEnv(gym.Env):
         cruise_speed: float = None,
         brake_dist: float = None,
         accel: float = None,
-        max_ticks: int = 280,
+        max_ticks: int = 300,
     ):
         """Standard stop-and-go cell move used during RL training and step()."""
         cruise_speed = self.cruise_speed if cruise_speed is None else cruise_speed
@@ -366,6 +482,7 @@ class MazeHierEnv(gym.Env):
         dt = self.model.opt.timestep
         v_cmd = 0.12
         a_brake = 0.85 * (cruise_speed ** 2) / (2.0 * brake_dist)
+        prev_rf = self._read_rangefinders()
 
         for _ in range(max_ticks):
             rf = self._read_rangefinders()
@@ -384,7 +501,8 @@ class MazeHierEnv(gym.Env):
             self._set_vw(v_cmd, w_cmd)
             self._sim_tick()
 
-            dist += self._read_forward_speed() * dt
+            dist += self._fused_step_distance(prev_rf, rf, dt)
+            prev_rf = rf
 
             if dist > 0.16 and rf_f < self.front_center + 0.012:
                 break
@@ -401,11 +519,11 @@ class MazeHierEnv(gym.Env):
         brake_dist: float = None,
         cruise_speed: float = None,
         accel: float = None,
-        max_ticks: int = 280,
+        max_ticks: int = 300,
     ) -> dict:
         """
-        Phase B with front-wall-aware braking (15% safety margin) and
-        Lookahead Cruise-Through for non-stop straightaways.
+        Phase B with slip-resistant ToF-fused odometry, non-stop straightaway chaining,
+        and continuous R=0.15 m curved arc turns at clear 90° corners.
         """
         cruise_speed = self.cruise_speed if cruise_speed is None else cruise_speed
         brake_dist = self.brake_dist if brake_dist is None else brake_dist
@@ -415,12 +533,16 @@ class MazeHierEnv(gym.Env):
         peeked = False
         next_action = None
         stop_at_end = True
+        arc_corner = False
         hit_wall = False
         at_goal = False
-        peek_dist = self.cell_size - brake_dist  # 0.20 m
+
+        # Peek slightly earlier (0.16 m) when arc turns are enabled so R=0.15 m aligns cleanly
+        peek_dist = 0.16 if self.enable_arc_turns else (self.cell_size - brake_dist)
         dt = self.model.opt.timestep
         v_cmd = max(0.12, self._read_forward_speed())
         a_brake = 0.85 * (cruise_speed ** 2) / (2.0 * brake_dist)
+        prev_rf = self._read_rangefinders()
 
         for _ in range(max_ticks):
             rf = self._read_rangefinders()
@@ -437,24 +559,46 @@ class MazeHierEnv(gym.Env):
                 else:
                     next_action = int(peek_fn(obs))
                     front_open = (obs[0] > 0.5) and (rf_f > self.cell_size * 0.85)
-                    stop_at_end = not (next_action == 0 and front_open)
+                    side_clear = (
+                        (next_action == 1 and obs[1] > 0.5 and rf["fl"] > 0.10)
+                        or (next_action == 2 and obs[2] > 0.5 and rf["fr"] > 0.10)
+                    )
+                    if next_action == 0 and front_open:
+                        stop_at_end = False
+                    elif (
+                        self.enable_arc_turns
+                        and next_action in (1, 2)
+                        and side_clear
+                        and self.current_friction >= 0.45
+                    ):
+                        stop_at_end = False
+                        arc_corner = True
+                    else:
+                        stop_at_end = True
 
             remaining = max(0.0, self.cell_size - dist)
             wall_rem = max(0.0, rf_f - self.front_center)
-            effective_rem = min(remaining, wall_rem) if stop_at_end else wall_rem
 
-            if effective_rem <= brake_dist:
-                v_target = max(0.07, math.sqrt(2.0 * a_brake * effective_rem))
-                v_cmd = min(v_cmd, v_target)
+            if arc_corner:
+                # Decelerate smoothly to arc entry speed (0.30 m/s) at junction entrance
+                v_cmd = max(0.28, v_cmd - 1.8 * dt)
             else:
-                v_cmd = min(cruise_speed, v_cmd + accel * dt)
+                effective_rem = min(remaining, wall_rem) if stop_at_end else wall_rem
+                if effective_rem <= brake_dist:
+                    v_target = max(0.07, math.sqrt(2.0 * a_brake * effective_rem))
+                    v_cmd = min(v_cmd, v_target)
+                else:
+                    v_cmd = min(cruise_speed, v_cmd + accel * dt)
 
             w_cmd = self._compute_corridor_steering(rf)
             self._set_vw(v_cmd, w_cmd)
             self._sim_tick()
 
-            dist += self._read_forward_speed() * dt
+            dist += self._fused_step_distance(prev_rf, rf, dt)
+            prev_rf = rf
 
+            if arc_corner and dist >= 0.16:
+                break
             if stop_at_end and dist > 0.16 and rf_f < self.front_center + 0.012:
                 break
             if rf_f < self.front_center - 0.015:
@@ -466,6 +610,17 @@ class MazeHierEnv(gym.Env):
 
         if not peeked and dist > 0.15:
             self._advance_odom_cell()
+
+        if arc_corner and not hit_wall and not at_goal:
+            arc_ok = self.drive_arc_turn(next_action)
+            # Exiting R=0.15 m arc places buggy 0.15 m past junction center -> carry=0.15
+            return {
+                "next_action": 0,  # Already turned onto new heading; drive straight into next cell
+                "stopped": not arc_ok,
+                "carry": 0.15 if arc_ok else 0.0,
+                "hit_wall": hit_wall,
+                "at_goal": self._check_goal(),
+            }
 
         if stop_at_end:
             self._settle_stop()
@@ -500,6 +655,9 @@ class MazeHierEnv(gym.Env):
         )
         self._cache_ids()
 
+        mu = float(self.rng.uniform(self.friction_range[0], self.friction_range[1]))
+        self._apply_surface_friction(mu)
+
         sx, sy = self.maze["start_xy"]
         gx, gy = self.maze["goal_xy"]
         self.odom_c = int(sx // self.cell_size)
@@ -507,6 +665,7 @@ class MazeHierEnv(gym.Env):
         self.goal_c = int(gx // self.cell_size)
         self.goal_r = int(gy // self.cell_size)
         self.odom_h = 0
+        self.target_yaw = 0.0
         self.odom_yaw = 0.0
         self.visited_counts = {(self.odom_r, self.odom_c): 1}
         self.moves = 0
@@ -520,7 +679,7 @@ class MazeHierEnv(gym.Env):
         self.wall_hits = 0
         self._move_wall_hits = 0
 
-        return self._get_obs(), {"maze_seed": maze_seed}
+        return self._get_obs(), {"maze_seed": maze_seed, "friction": self.current_friction}
 
     def step(self, action):
         action = int(action)
