@@ -1,0 +1,77 @@
+<mujoco model="maze_buggy">
+  <compiler angle="degree" autolimits="true" />
+  <option timestep="0.005" />
+  <worldbody>
+    <body name="buggy" pos="0 0 0.03">
+      <freejoint name="root" />
+      <geom name="chassis" type="box" size="0.06 0.048 0.015" mass="0.35" priority="1" friction="0.02 0.001 0.0001" rgba="0.15 0.45 0.85 1" />
+      <geom name="front_skid" type="sphere" pos="0.050 0 -0.0195" size="0.010" mass="0.01" priority="1" friction="0.005 0.001 0.0001" rgba="0.5 0.5 0.5 1" />
+      <geom name="rear_skid" type="sphere" pos="-0.050 0 -0.0195" size="0.010" mass="0.01" priority="1" friction="0.005 0.001 0.0001" rgba="0.5 0.5 0.5 1" />
+      <geom name="left_guard" type="capsule" pos="0.01 0.0715 0.0" size="0.0025 0.030" euler="0 90 0" mass="0.005" priority="1" friction="0.01 0.001 0.0001" rgba="0.3 0.3 0.3 0.8" />
+      <geom name="right_guard" type="capsule" pos="0.01 -0.0715 0.0" size="0.0025 0.030" euler="0 90 0" mass="0.005" priority="1" friction="0.01 0.001 0.0001" rgba="0.3 0.3 0.3 0.8" />
+      <site name="imu" pos="0 0 0" size="0.005" rgba="0 1 0 1" />
+      <site name="prox_front" pos="0.062 0 0" zaxis="1 0 0" size="0.004" rgba="1 0 0 1" />
+      <site name="prox_back" pos="-0.062 0 0" zaxis="-1 0 0" size="0.004" rgba="1 0 0 1" />
+      <site name="prox_left" pos="0 0.075 0.025" zaxis="0 1 0" size="0.004" rgba="1 0 0 1" />
+      <site name="prox_right" pos="0 -0.075 0.025" zaxis="0 -1 0" size="0.004" rgba="1 0 0 1" />
+      <site name="prox_fl" pos="0.05 0.06 0" zaxis="1 1 0" size="0.004" rgba="1 0.5 0 1" />
+      <site name="prox_fr" pos="0.05 -0.06 0" zaxis="1 -1 0" size="0.004" rgba="1 0.5 0 1" />
+      <body name="left_wheel" pos="0.01 0.06 0">
+        <joint name="left_wheel_joint" type="hinge" axis="0 1 0" damping="0.002" armature="0.005" />
+        <geom name="left_wheel_geom" type="cylinder" size="0.03 0.008" euler="90 0 0" mass="0.05" friction="1.0 0.005 0.0001" rgba="0.1 0.1 0.1 1" />
+      </body>
+      <body name="right_wheel" pos="0.01 -0.06 0">
+        <joint name="right_wheel_joint" type="hinge" axis="0 1 0" damping="0.002" armature="0.005" />
+        <geom name="right_wheel_geom" type="cylinder" size="0.03 0.008" euler="90 0 0" mass="0.05" friction="1.0 0.005 0.0001" rgba="0.1 0.1 0.1 1" />
+      </body>
+      <geom name="lidar_turret" type="cylinder" pos="0 0 0.0680" size="0.028 0.010" rgba="0.10 0.72 0.95 1" contype="0" conaffinity="0" mass="0.02" />
+      <site name="lidar_00" pos="0.0450 0.0000 0.0680" zaxis="1.000000 0.000000 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_01" pos="0.0416 0.0172 0.0680" zaxis="0.923880 0.382683 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_02" pos="0.0318 0.0318 0.0680" zaxis="0.707107 0.707107 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_03" pos="0.0172 0.0416 0.0680" zaxis="0.382683 0.923880 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_04" pos="0.0000 0.0450 0.0680" zaxis="0.000000 1.000000 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_05" pos="-0.0172 0.0416 0.0680" zaxis="-0.382683 0.923880 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_06" pos="-0.0318 0.0318 0.0680" zaxis="-0.707107 0.707107 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_07" pos="-0.0416 0.0172 0.0680" zaxis="-0.923880 0.382683 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_08" pos="-0.0450 0.0000 0.0680" zaxis="-1.000000 0.000000 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_09" pos="-0.0416 -0.0172 0.0680" zaxis="-0.923880 -0.382683 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_10" pos="-0.0318 -0.0318 0.0680" zaxis="-0.707107 -0.707107 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_11" pos="-0.0172 -0.0416 0.0680" zaxis="-0.382683 -0.923880 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_12" pos="-0.0000 -0.0450 0.0680" zaxis="-0.000000 -1.000000 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_13" pos="0.0172 -0.0416 0.0680" zaxis="0.382683 -0.923880 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_14" pos="0.0318 -0.0318 0.0680" zaxis="0.707107 -0.707107 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+      <site name="lidar_15" pos="0.0416 -0.0172 0.0680" zaxis="0.923880 -0.382683 0.0" size="0.004" rgba="0.1 0.9 1.0 0.6" />
+    </body>
+  </worldbody>
+  <actuator>
+    <velocity name="left_vel" joint="left_wheel_joint" kv="0.5" ctrlrange="-40 40" forcerange="-2 2" />
+    <velocity name="right_vel" joint="right_wheel_joint" kv="0.5" ctrlrange="-40 40" forcerange="-2 2" />
+  </actuator>
+  <sensor>
+    <jointvel name="enc_left_vel" joint="left_wheel_joint" />
+    <jointvel name="enc_right_vel" joint="right_wheel_joint" />
+    <gyro name="gyro" site="imu" />
+    <rangefinder name="rf_front" site="prox_front" cutoff="1.2" />
+    <rangefinder name="rf_back" site="prox_back" cutoff="1.2" />
+    <rangefinder name="rf_left" site="prox_left" cutoff="1.2" />
+    <rangefinder name="rf_right" site="prox_right" cutoff="1.2" />
+    <rangefinder name="rf_fl" site="prox_fl" cutoff="1.2" />
+    <rangefinder name="rf_fr" site="prox_fr" cutoff="1.2" />
+    <rangefinder name="lidar_00" site="lidar_00" cutoff="2.00" />
+    <rangefinder name="lidar_01" site="lidar_01" cutoff="2.00" />
+    <rangefinder name="lidar_02" site="lidar_02" cutoff="2.00" />
+    <rangefinder name="lidar_03" site="lidar_03" cutoff="2.00" />
+    <rangefinder name="lidar_04" site="lidar_04" cutoff="2.00" />
+    <rangefinder name="lidar_05" site="lidar_05" cutoff="2.00" />
+    <rangefinder name="lidar_06" site="lidar_06" cutoff="2.00" />
+    <rangefinder name="lidar_07" site="lidar_07" cutoff="2.00" />
+    <rangefinder name="lidar_08" site="lidar_08" cutoff="2.00" />
+    <rangefinder name="lidar_09" site="lidar_09" cutoff="2.00" />
+    <rangefinder name="lidar_10" site="lidar_10" cutoff="2.00" />
+    <rangefinder name="lidar_11" site="lidar_11" cutoff="2.00" />
+    <rangefinder name="lidar_12" site="lidar_12" cutoff="2.00" />
+    <rangefinder name="lidar_13" site="lidar_13" cutoff="2.00" />
+    <rangefinder name="lidar_14" site="lidar_14" cutoff="2.00" />
+    <rangefinder name="lidar_15" site="lidar_15" cutoff="2.00" />
+  </sensor>
+</mujoco>
